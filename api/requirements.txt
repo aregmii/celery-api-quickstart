@@ -1,0 +1,9 @@
+fastapi
+redis
+uvicorn[standard]
+celery[redis]
+asyncpg
+pydantic
+pydantic-settings
+pytest
+pytest-asyncio
