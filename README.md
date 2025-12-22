@@ -179,7 +179,7 @@ curl http://localhost:8000/poll/{task_id} \
 
 ### 1. Task Submission (POST /task)
 
-Auth checks Redis first, falls back to Postgres. Credit reservation is atomic via Lua script.
+Auth checks Redis first, falls back to Postgres. Credit reservation + task creation combined into single atomic Lua script for speed.
 
 ```mermaid
 sequenceDiagram
@@ -207,11 +207,11 @@ sequenceDiagram
         end
     end
 
-    Note over API: STEP 2: Reserve credits (atomic Lua script)
+    Note over API: STEP 2: Reserve credits + create task (single atomic Lua script)
 
-    API->>Redis: Reserve 1 credit (Lua script)
+    API->>Redis: Lua script: reserve credits + create task cache
 
-    Note over Redis: Lua script atomically:<br/>1. Check available >= 1<br/>2. Increment reserved_credits<br/>3. Create reservation record
+    Note over Redis: Lua script atomically:<br/>1. Check available >= 1<br/>2. Increment reserved_credits<br/>3. Create reservation record<br/>4. Create task cache (for fast polling)
 
     alt insufficient credits
         Redis-->>API: Error: insufficient credits
@@ -220,27 +220,38 @@ sequenceDiagram
         Redis-->>API: reservation_id
     end
 
-    Note over API: STEP 3: Create task in Redis
-
-    API->>Redis: Store task data (status=pending)
-
-    Note over API: STEP 4: Persist to Postgres
+    Note over API: STEP 3: Persist to Postgres (synchronous for durability)
 
     API->>Postgres: Insert task row
     Postgres-->>API: OK
 
     Note over API: If Postgres fails → rollback Redis → 500
 
-    Note over API: STEP 5: Queue to Celery
+    Note over API: STEP 4: Queue to Celery
 
     API->>Redis: Push task to Celery queue
 
     API-->>Client: 202 {task_id}
 ```
 
+**Trade-offs:**
+
+| Decision | Benefit | Alternative |
+|----------|---------|-------------|
+| Combined Lua script (reserve + create task) | 1 fewer Redis round-trip | Separate calls: simpler but slower |
+| Synchronous Postgres write | Durability - task survives Redis crash | Async write: faster but risks data loss |
+| Task cached in Redis | Fast polling (single Redis call) | No cache: simpler but polling hits Postgres |
+
+**Potential further optimizations:**
+- Batch multiple task submissions in single request
+- Pipeline Redis calls (auth + Lua script together)
+- Async Postgres write with background reconciliation
+
+---
+
 ### 2. Poll for Result (GET /poll/{task_id})
 
-**Optimized:** Single Redis call returns task with owner for ownership check.
+**Optimized:** Single Redis call returns task with owner for ownership check. No separate auth lookup.
 
 ```mermaid
 sequenceDiagram
@@ -271,6 +282,16 @@ sequenceDiagram
         end
     end
 ```
+
+**Trade-offs:**
+
+| Decision | Benefit | Alternative |
+|----------|---------|-------------|
+| Task includes owner_api_key | Ownership check without separate auth call | Separate auth: 2 Redis calls instead of 1 |
+| Redis-first with Postgres fallback | Fast for recent tasks, durable for old tasks | Postgres-only: consistent but slower |
+| No re-caching on Postgres hit | Simpler logic | Re-cache: faster subsequent polls but more writes |
+
+---
 
 ### 3. Worker Processing
 
@@ -321,6 +342,22 @@ sequenceDiagram
     end
 ```
 
+**Trade-offs:**
+
+| Decision | Benefit | Alternative |
+|----------|---------|-------------|
+| Idempotency check via Postgres | Prevents double-processing after crash | Redis check: faster but could be stale |
+| Postgres-first writes | Durability - survives Redis crash | Redis-first: faster but risks inconsistency |
+| One task at a time (prefetch=1) | Predictable for GPU workloads | Prefetch multiple: higher throughput but memory issues |
+| Late acknowledgment | Task retries if worker crashes | Early ack: faster but loses tasks on crash |
+
+**Potential further optimizations:**
+- Pipeline Postgres + Redis updates
+- Batch credit commits for multiple completed tasks
+- Skip Redis writes if Redis is slow (Postgres is source of truth)
+
+---
+
 ### 4. Admin Update Credits (POST /admin/credits)
 
 **Both stores updated synchronously.** If Redis fails after Postgres, request fails.
@@ -348,12 +385,25 @@ sequenceDiagram
     API->>Redis: Update user total_credits = 1000
 
     alt Redis update fails
-        Note over API: Postgres updated but Redis failed<br/>Fail request to signal inconsistency
+        Note over API: Postgres updated but Redis failed
         API-->>Admin: 500 Credit update failed
     else success
         API-->>Admin: 200 Credits updated
     end
 ```
+
+**Trade-offs:**
+
+| Decision | Benefit | Alternative |
+|----------|---------|-------------|
+| Postgres-first write | Durability guaranteed | Redis-first: faster but risks data loss |
+| Fail if Redis update fails | Signals inconsistency to admin | Accept inconsistency: simpler but confusing |
+| No Postgres rollback on Redis failure | Simpler, Postgres is truth anyway | Rollback: perfect consistency but complex |
+
+**Potential further optimizations:**
+- Store old value before Postgres update, rollback if Redis fails
+- Background job to sync Redis from Postgres periodically
+- Pub/sub to invalidate Redis cache across regions
 
 ---
 

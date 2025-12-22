@@ -35,12 +35,15 @@ class TaskService:
         """
         Submit a new task for processing with proper reservation and rollback.
 
-        Flow:
-        1. Reserve credits in Redis (atomic)
-        2. Create task:{task_id} in Redis
-        3. INSERT INTO tasks in Postgres (synchronous)
-        4. Push to Celery queue
-        5. Return 202
+        Optimized Flow (3 network calls instead of 5):
+        1. Reserve credits + create task cache in Redis (single atomic Lua script)
+        2. Persist to Postgres (synchronous for durability)
+        3. Push to Celery queue
+
+        Trade-offs considered:
+        - Combined Lua script saves 1 Redis round-trip
+        - Postgres write is synchronous (not async) to ensure durability
+        - Could batch multiple task submissions for further optimization
 
         Raises:
             InsufficientCreditsError: If user doesn't have enough credits
@@ -50,34 +53,25 @@ class TaskService:
 
         task_id = str(uuid.uuid4())
         reservation_id = None
-        task_in_redis = False
-        task_in_postgres = False
 
         try:
-            # STEP 1: Reserve credits in Redis (atomic Lua script)
-            # This validates user exists AND has sufficient credits
-            reservation_id = self.redis_service.reserve_credits(
-                user.api_key, credits_required, task_id
+            # STEP 1: Reserve credits + create task cache (single atomic Lua script)
+            # This validates user exists, has sufficient credits, reserves them,
+            # creates reservation record, AND creates task cache - all in ONE call
+            reservation_id = self.redis_service.reserve_credits_and_create_task(
+                api_key=user.api_key,
+                credits=credits_required,
+                task_id=task_id,
+                a=a,
+                b=b
             )
-            # reserve_credits raises InvalidApiKeyError or InsufficientCreditsError on failure
             if reservation_id is None:
                 raise Exception("Credit reservation failed unexpectedly")
 
-            logger.info(f"Reserved {credits_required} credits for task={task_id[:8]}...")
+            logger.info(f"Reserved {credits_required} credits + created task={task_id[:8]}...")
 
-            # STEP 2: Create task in Redis
-            task_in_redis = self.redis_service.create_task(
-                task_id=task_id,
-                owner_api_key=user.api_key,
-                a=a,
-                b=b,
-                credits_required=credits_required,
-                reservation_id=reservation_id
-            )
-            if not task_in_redis:
-                raise Exception("Failed to create task in Redis")
-
-            # STEP 3: Persist to Postgres (SYNCHRONOUS - must succeed)
+            # STEP 2: Persist to Postgres (SYNCHRONOUS - must succeed for durability)
+            # Trade-off: Could be async for speed, but risks data loss if Redis crashes
             await self.task_repo.create_task(
                 task_id=task_id,
                 owner_api_key=user.api_key,
@@ -85,27 +79,25 @@ class TaskService:
                 b=b,
                 credits_required=credits_required
             )
-            task_in_postgres = True
 
-            # STEP 4: Enqueue to Celery
+            # STEP 3: Enqueue to Celery
             compute_task.delay(task_id, a, b, reservation_id)
 
             logger.info(f"Submitted task={task_id[:8]}... for user={user.name}")
             return task_id
 
         except (InsufficientCreditsError, InvalidApiKeyError):
-            # These are expected errors - no rollback needed for credit reservation
-            # (it was never successful)
+            # These are expected errors - no rollback needed
+            # (Lua script is atomic, nothing was committed)
             raise
 
         except Exception as e:
             # Rollback on any unexpected failure
             logger.error(f"Task submission failed, rolling back: {e}")
 
-            if task_in_redis:
-                self.redis_service.delete_task(task_id)
-
             if reservation_id:
+                # This also deletes the task cache created by the Lua script
+                self.redis_service.delete_task(task_id)
                 self.redis_service.rollback_credits(reservation_id)
 
             raise

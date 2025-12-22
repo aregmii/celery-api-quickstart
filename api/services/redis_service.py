@@ -17,16 +17,21 @@ from logger import get_logger
 logger = get_logger(__name__)
 
 
-# Lua: reserve credits atomically
+# Lua: reserve credits AND create task atomically (single network call)
+# Combines credit reservation + task cache creation for speed optimization
 # if user not in Redis → USER_NOT_FOUND
 # if available < credits → INSUFFICIENT_CREDITS
-# else → reserve and return reservation_id
-RESERVE_CREDITS_SCRIPT = """
+# else → reserve credits, create reservation, create task cache
+RESERVE_AND_CREATE_TASK_SCRIPT = """
 local user_key = KEYS[1]
 local reservation_key = KEYS[2]
+local task_key = KEYS[3]
 local credits = tonumber(ARGV[1])
 local reservation_id = ARGV[2]
 local task_id = ARGV[3]
+local owner_api_key = ARGV[4]
+local a = ARGV[5]
+local b = ARGV[6]
 
 if redis.call('EXISTS', user_key) == 0 then
     return cjson.encode({err = 'USER_NOT_FOUND'})
@@ -41,8 +46,25 @@ if available < credits then
     return cjson.encode({err = 'INSUFFICIENT_CREDITS', available = available})
 end
 
+-- All operations below are atomic (single Redis call)
+-- 1. Reserve credits
 redis.call('HINCRBY', user_key, 'reserved_credits', credits)
+
+-- 2. Create reservation record
 redis.call('HSET', reservation_key, 'user_key', user_key, 'credits', credits, 'task_id', task_id)
+
+-- 3. Create task cache (for fast polling)
+redis.call('HSET', task_key,
+    'owner_api_key', owner_api_key,
+    'a', a,
+    'b', b,
+    'credits_required', credits,
+    'status', 'pending',
+    'result', '',
+    'error_message', '',
+    'reservation_id', reservation_id
+)
+
 return cjson.encode({ok = true, reservation_id = reservation_id})
 """
 
@@ -85,15 +107,25 @@ class RedisService:
 
     def __init__(self, redis_client: redis.Redis):
         self.redis = redis_client
-        self._reserve_script = self.redis.register_script(RESERVE_CREDITS_SCRIPT)
+        self._reserve_and_create_task_script = self.redis.register_script(RESERVE_AND_CREATE_TASK_SCRIPT)
         self._rollback_script = self.redis.register_script(ROLLBACK_CREDITS_SCRIPT)
         self._commit_script = self.redis.register_script(COMMIT_CREDITS_SCRIPT)
 
     # --- Credit Operations ---
 
-    def reserve_credits(self, api_key: str, credits: int, task_id: str) -> Optional[str]:
+    def reserve_credits_and_create_task(
+        self,
+        api_key: str,
+        credits: int,
+        task_id: str,
+        a: int,
+        b: int
+    ) -> Optional[str]:
         """
-        Reserve credits for task. Atomic Lua script.
+        Reserve credits AND create task cache in ONE atomic Lua script call.
+
+        This combines what was previously 2 Redis calls into 1 for speed optimization.
+        Creates: reservation record + task cache (for fast polling)
 
         Returns reservation_id if success else raises.
         Raises InvalidApiKeyError if user not in Redis.
@@ -104,11 +136,12 @@ class RedisService:
         reservation_id = str(uuid.uuid4())
         user_key = f"user:{api_key}"
         reservation_key = f"reservation:{reservation_id}"
+        task_key = f"task:{task_id}"
 
         try:
-            result = self._reserve_script(
-                keys=[user_key, reservation_key],
-                args=[credits, reservation_id, task_id]
+            result = self._reserve_and_create_task_script(
+                keys=[user_key, reservation_key, task_key],
+                args=[credits, reservation_id, task_id, api_key, a, b]
             )
             data = json.loads(result)
 
@@ -119,11 +152,11 @@ class RedisService:
                     raise InsufficientCreditsError()
                 return None
 
-            logger.info(f"reserve: {credits} credits, task={task_id[:8]}")
+            logger.info(f"reserve+create: {credits} credits, task={task_id[:8]}")
             return reservation_id
 
         except (redis.RedisError, json.JSONDecodeError) as e:
-            logger.error(f"reserve failed: {e}")
+            logger.error(f"reserve+create failed: {e}")
             return None
 
     def rollback_credits(self, reservation_id: str) -> bool:
