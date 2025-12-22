@@ -34,7 +34,7 @@ docker compose ps
 
 ---
 
-## Demo Flow (Follow This Order)
+## Demo Flow
 
 ### Step 1: Health Check
 
@@ -43,8 +43,6 @@ curl http://localhost:8000/health
 ```
 
 **Expected:** `{"status":"healthy"}`
-
-**Say:** "Basic health check, used by load balancers."
 
 ---
 
@@ -61,11 +59,9 @@ curl -X POST http://localhost:8000/task \
 
 **Copy the task_id!**
 
-**Say:** "Task submitted. Before queuing, we validated: auth token, available credits, input types. Credits are now reserved atomically via Lua script."
-
-**Show in Flower:** Click "Tasks" tab - you'll see the task appear.
-
-**Show in Terminal:** Worker logs show task picked up.
+**Verify:**
+- Flower UI → Tasks tab → task appears
+- Worker logs → task picked up
 
 ---
 
@@ -78,8 +74,6 @@ curl http://localhost:8000/poll/<TASK_ID> \
 
 **Expected (if fast):** `{"status":"pending","result":null,"error_message":null}`
 
-**Say:** "Polling hits Redis first - single call returns task with ownership check. No separate auth lookup."
-
 ---
 
 ### Step 4: Poll Again (After ~2 seconds)
@@ -91,29 +85,27 @@ curl http://localhost:8000/poll/<TASK_ID> \
 
 **Expected:** `{"status":"complete","result":8,"error_message":null}`
 
-**Say:** "Task complete. 5 + 3 = 8. Credits moved from reserved to spent. Worker wrote to Postgres first (durable), then Redis (fast reads)."
-
-**Show in Flower:** Task shows SUCCESS status.
+**Verify:** Flower UI → task shows SUCCESS
 
 ---
 
 ### Step 5: Check Database State
 
-**Show Postgres (users):**
+**Users:**
 ```bash
 docker compose exec postgres psql -U postgres -c \
   "SELECT name, total_credits, spent_credits FROM users;"
 ```
 
-**Say:** "test_user1 now has spent_credits = 1. Postgres is source of truth."
+**Verify:** test_user1 has spent_credits = 1
 
-**Show Postgres (tasks):**
+**Tasks:**
 ```bash
 docker compose exec postgres psql -U postgres -c \
   "SELECT id, status, a, b, result FROM tasks ORDER BY created_at DESC LIMIT 3;"
 ```
 
-**Say:** "Task persisted with complete status and result."
+**Verify:** Task persisted with complete status and result
 
 ---
 
@@ -127,8 +119,6 @@ curl -X POST http://localhost:8000/admin/credits \
 ```
 
 **Expected:** `{"message":"Credits updated"}`
-
-**Say:** "Admin endpoint. Writes to Postgres first, then Redis. Both must succeed or request fails."
 
 **Verify:**
 ```bash
@@ -150,8 +140,6 @@ curl -X POST http://localhost:8000/task \
 
 **Expected:** `{"detail":"Invalid API key"}`
 
-**Say:** "Auth fails fast - checked in Redis first, then Postgres fallback. Invalid key never reaches the queue."
-
 ---
 
 **Non-Admin Access (403):**
@@ -163,8 +151,6 @@ curl -X POST http://localhost:8000/admin/credits \
 ```
 
 **Expected:** `{"detail":"Admin access required"}`
-
-**Say:** "Authorization check - only admin user can update credits."
 
 ---
 
@@ -191,15 +177,9 @@ done
 wait
 ```
 
-**Show in Flower:**
-- Click "Tasks" - see multiple tasks queued
-- Watch them process one at a time (worker_prefetch_multiplier=1)
-
-**Show in Terminal (worker logs):**
-- Tasks processing sequentially
-- Each takes ~2 seconds
-
-**Say:** "Worker processes one task at a time - critical for GPU workloads. Queue builds up, workers drain it. This is how we'd scale horizontally."
+**Verify:**
+- Flower UI → Tasks tab → multiple tasks queued, consumed one at a time
+- Worker logs → tasks processing sequentially (~2 seconds each)
 
 ---
 
@@ -209,7 +189,7 @@ wait
 docker compose logs web --tail=20
 ```
 
-**Say:** "All logs are structured JSON with request_id for distributed tracing. Ready for Datadog/Splunk/ELK."
+**Verify:** Logs are structured JSON with request_id
 
 ---
 
@@ -258,23 +238,9 @@ docker compose up -d
 **Task stuck in pending?**
 ```bash
 docker compose logs worker
-# Check if worker is connected
 ```
 
 **Port already in use?**
 ```bash
 lsof -i :8000
-# Kill the process or restart Docker
 ```
-
----
-
-## Key Points to Mention During Demo
-
-1. **Speed first:** Redis handles all hot-path operations
-2. **Atomic credits:** Lua scripts prevent race conditions
-3. **Input validation:** All checks happen BEFORE queuing
-4. **One task at a time:** `worker_prefetch_multiplier=1` for GPU workloads
-5. **Late ack:** If worker crashes, task retries automatically
-6. **Postgres = truth:** Redis is just a fast cache
-7. **Structured logs:** Ready for production observability
