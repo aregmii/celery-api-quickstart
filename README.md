@@ -109,34 +109,6 @@ curl http://localhost:8000/poll/{task_id} \
 
 ---
 
-## Redis/Postgres Consistency
-
-**Q: What if user is in Postgres but not in Redis?**
-
-Auth flow handles this automatically:
-1. Check Redis for user → miss
-2. Query Postgres → found
-3. Populate Redis with user data
-4. Continue with request
-
-**Q: When does startup sync run?**
-
-Only for **recovery** (Redis empty/crashed):
-```
-API starts → if user not in Redis → sync from Postgres
-```
-During normal operation, Redis already has data. New pods don't re-sync.
-
-**Q: How are writes kept consistent?**
-
-| Operation | Write Order | Rollback if fail? |
-|-----------|-------------|-------------------|
-| Task submit | Redis first (reserve), then Postgres | Yes, rollback Redis |
-| Task complete | Postgres first, then Redis | No (Postgres is truth) |
-| Admin credit update | Postgres first, then Redis | Fail request if Redis fails |
-
----
-
 ## Data Model
 
 ### PostgreSQL (Durable Storage)
@@ -200,21 +172,6 @@ During normal operation, Redis already has data. New pods don't re-sync.
 | task_id | Task identifier |
 | a, b | Input parameters |
 | reservation_id | For credit tracking |
-
----
-
-## Credit Model
-
-```
-available_credits = total_credits - reserved_credits - spent_credits
-```
-
-**Flow:**
-1. **Task submitted** → Credits reserved (available → reserved)
-2. **Task succeeds** → Credits committed (reserved → spent)
-3. **Task fails** → Credits released (reserved → available)
-
-**Users are only charged for successfully completed work.**
 
 ---
 
@@ -726,40 +683,6 @@ db_pool = await asyncpg.create_pool(
 
 ---
 
-# Implementation Checklist
-
-## Core (Must Have)
-- [ ] Credit logic: reserve → commit/release
-- [ ] Distributed caching: user + task in Redis
-- [ ] Input validation: auth + credits + types before queue
-- [ ] Rollback on failure at any step
-
-## Worker (Must Have)
-- [ ] Redis task backend
-- [ ] Failure handling with retry
-- [ ] Celery disconnect handling
-- [ ] Ready signal after model load
-- [ ] One task at a time (prefetch=1)
-
-## Observability (Should Have)
-- [ ] Structured JSON logging
-- [ ] Distributed tracing (X-Request-ID)
-- [ ] Key metrics exposed
-
-## Kubernetes (Discussion + Demo if time)
-- [ ] Deployment manifests
-- [ ] HPA for API (CPU-based)
-- [ ] HPA for Workers (queue depth)
-- [ ] Network/connection pooling strategy
-
-## Multi-Region (Discussion Only)
-- [ ] Architecture diagram
-- [ ] Database replication strategy
-- [ ] Redis per region approach
-- [ ] Latency tradeoffs understood
-
----
-
 # Project Structure
 
 ```
@@ -783,7 +706,7 @@ db_pool = await asyncpg.create_pool(
 │   ├── services/
 │   │   ├── auth_service.py
 │   │   ├── task_service.py
-│   │   └── redis_service.py  # NEW: atomic Redis ops
+│   │   └── redis_service.py  # Atomic Redis ops
 │   ├── repositories/
 │   └── worker/
 │       └── tasks.py
@@ -792,25 +715,235 @@ db_pool = await asyncpg.create_pool(
 
 ---
 
-# Testing
-
-```bash
-# Unit tests
-docker compose exec web pytest tests/ -v
-
-# Integration tests
-docker compose exec web python scripts/test_integration.py
-
-# Load test (queue depth demo)
-docker compose exec web python scripts/load_test.py --tasks 100
-```
-
----
-
 # Monitoring
 
 | Service | URL | Purpose |
 |---------|-----|---------|
+| API | http://localhost:8000 | FastAPI application |
+| API Docs | http://localhost:8000/docs | Swagger UI |
 | Flower | http://localhost:5555 | Celery task monitoring |
 | pgAdmin | http://localhost:5050 | PostgreSQL admin |
 | RedisInsight | http://localhost:5540 | Redis admin |
+
+---
+
+# Testing & Verification
+
+Step-by-step guide to test the system and verify each operation through the admin UIs.
+
+## 1. Start the Stack
+
+```bash
+# Build and start all services
+docker compose up --build -d
+
+# Verify all services are healthy
+docker compose ps
+
+# Watch logs (in a separate terminal)
+docker compose logs -f web worker
+```
+
+## 2. Verify Database Setup
+
+**Check users and tasks tables in pgAdmin:**
+
+1. Open http://localhost:5050
+2. Login: `admin@admin.com` / `admin`
+3. Add server: Host=`postgres`, Port=`5432`, User=`postgres`, Password=`postgres`
+4. Navigate to: Servers → postgres → Databases → postgres → Schemas → public → Tables
+5. Right-click `users` → View/Edit Data → All Rows
+
+You should see the seeded test users (admin, test_user1, test_user2).
+
+## 3. Check Redis State
+
+**View user and task hashes in RedisInsight:**
+
+1. Open http://localhost:5540
+2. Add database: Host=`localhost`, Port=`6379`
+3. Click "Browser" in the left sidebar
+4. Search for `user:*` to see cached user data
+
+Initially empty until first API request populates the cache.
+
+## 4. Submit a Task
+
+```bash
+# Submit task as test_user1
+curl -X POST http://localhost:8000/task \
+  -H "Authorization: Bearer 550e8400-e29b-41d4-a716-446655440000" \
+  -H "Content-Type: application/json" \
+  -d '{"a": 5, "b": 3}'
+```
+
+Response: `{"task_id": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"}`
+
+**Verify in RedisInsight:**
+- Search `user:550e8400*` → see `reserved_credits` increased by 1
+- Search `task:*` → see new task hash with status=`pending`
+- Search `reservation:*` → see credit reservation record
+
+**Verify in pgAdmin:**
+- Query: `SELECT * FROM tasks ORDER BY created_at DESC LIMIT 1;`
+- See the new task with status=`pending`
+
+## 5. Watch Worker Process the Task
+
+**In Flower (http://localhost:5555):**
+
+1. Click "Tasks" in the top nav
+2. See `worker.tasks.compute_task` appear
+3. Watch status change: PENDING → STARTED → SUCCESS
+
+**In terminal (docker compose logs):**
+```
+worker  | Task task_id=abc123... starting
+worker  | Task task_id=abc123... completed with result=8
+```
+
+## 6. Poll for Result
+
+```bash
+# Replace with your actual task_id
+curl http://localhost:8000/poll/{task_id} \
+  -H "Authorization: Bearer 550e8400-e29b-41d4-a716-446655440000"
+```
+
+Response: `{"status": "complete", "result": 8, "error_message": null}`
+
+**Verify in RedisInsight:**
+- Search `task:{task_id}` → status=`complete`, result=`8`
+- Search `user:550e8400*` → `reserved_credits` decreased, `spent_credits` increased
+- Search `reservation:*` → reservation record deleted
+
+**Verify in pgAdmin:**
+- Query: `SELECT * FROM tasks WHERE id = '{task_id}';`
+- Status=`complete`, result=`8`
+- Query: `SELECT * FROM users WHERE api_key = '550e8400-e29b-41d4-a716-446655440000';`
+- `spent_credits` increased by 1
+
+## 7. Test Insufficient Credits
+
+```bash
+# Use test_user2 who has limited credits (250)
+# Submit many tasks to exhaust credits, then try again
+curl -X POST http://localhost:8000/task \
+  -H "Authorization: Bearer c56a4180-65aa-42ec-a945-5fd21dec0538" \
+  -H "Content-Type: application/json" \
+  -d '{"a": 1, "b": 1}'
+```
+
+When credits exhausted: `402 {"detail": "Insufficient credits"}`
+
+## 8. Test Invalid API Key
+
+```bash
+curl -X POST http://localhost:8000/task \
+  -H "Authorization: Bearer invalid-key-12345" \
+  -H "Content-Type: application/json" \
+  -d '{"a": 1, "b": 1}'
+```
+
+Response: `401 {"detail": "Invalid API key"}`
+
+## 9. Load Test (Queue Depth Demo)
+
+```bash
+# Submit 20 tasks rapidly to see queue build up
+for i in {1..20}; do
+  curl -s -X POST http://localhost:8000/task \
+    -H "Authorization: Bearer 550e8400-e29b-41d4-a716-446655440000" \
+    -H "Content-Type: application/json" \
+    -d "{\"a\": $i, \"b\": $i}" &
+done
+wait
+```
+
+**Watch in Flower:**
+- See tasks queuing up in "Active" and "Reserved" columns
+- Monitor worker processing rate
+
+**Watch in RedisInsight:**
+- Search `task:*` → see multiple tasks with various statuses
+- Check celery queue length (key pattern may vary by Celery version)
+
+## 10. Unit Tests
+
+```bash
+# Run pytest inside the web container
+docker compose exec web pytest tests/ -v
+```
+
+---
+
+# Credit Model
+
+```
+available_credits = total_credits - reserved_credits - spent_credits
+```
+
+**Flow:**
+1. **Task submitted** → Credits reserved (available → reserved)
+2. **Task succeeds** → Credits committed (reserved → spent)
+3. **Task fails** → Credits rolled back (reserved → available)
+
+**Users are only charged for successfully completed work.**
+
+---
+
+# FAQ
+
+## Redis/Postgres Consistency
+
+**Q: What if user is in Postgres but not in Redis?**
+
+Auth flow handles this automatically:
+1. Check Redis for user → miss
+2. Query Postgres → found
+3. Populate Redis with user data
+4. Continue with request
+
+**Q: When does startup sync run?**
+
+Only for **recovery** (Redis empty/crashed):
+```
+API starts → if user not in Redis → sync from Postgres
+```
+During normal operation, Redis already has data. New pods don't re-sync.
+
+**Q: How are writes kept consistent?**
+
+| Operation | Write Order | Rollback if fail? |
+|-----------|-------------|-------------------|
+| Task submit | Redis first (reserve), then Postgres | Yes, rollback Redis |
+| Task complete | Postgres first, then Redis | No (Postgres is truth) |
+| Admin credit update | Postgres first, then Redis | Fail request if Redis fails |
+
+## Queue Durability
+
+**Q: The Celery task queue is in Redis. What if we lose it?**
+
+The queue (`celery:task_queue`) is ephemeral. If Redis crashes and loses the queue:
+
+1. **Tasks in Postgres are the source of truth** - they have status `pending` or `in_progress`
+2. **Recovery process** reconstructs the queue:
+   ```sql
+   SELECT * FROM tasks
+   WHERE status IN ('pending', 'in_progress')
+   ORDER BY created_at ASC;  -- FIFO order preserved
+   ```
+3. Re-enqueue each task to Celery
+4. Workers' **idempotency check** prevents duplicate processing (checks Postgres status before work)
+
+The `created_at` timestamp ensures we maintain FIFO order when reconstructing the queue.
+
+**Q: Why not use a durable queue like RabbitMQ?**
+
+For AI inference workloads:
+- Tasks are already durable in Postgres
+- Redis queue loss is recoverable (see above)
+- Redis is faster for the polling hot path
+- Simpler architecture (one fewer service)
+
+Trade-off: Brief recovery delay vs. always-on durability. Acceptable for async workloads.
