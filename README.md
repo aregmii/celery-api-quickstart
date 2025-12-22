@@ -1,15 +1,17 @@
 # Task API
 
-An asynchronous task processing API with authentication, credit based inference workloads, and monitoring.
+A high-performance asynchronous task processing API designed for AI inference workloads. Features credit-based billing, distributed caching, and horizontal scaling.
+
+**Design Priority:** Speed first, reliability second.
 
 ## Components
 
 | Service | Purpose | Port |
 |---------|---------|------|
 | web | FastAPI application - handles HTTP requests | 8000 |
-| worker | Celery worker - processes async tasks | - |
-| postgres | PostgreSQL - persistent storage for users and tasks | 5432 |
-| redis | Redis - user cache (15s TTL) + Celery message broker | 6379 |
+| worker | Celery worker - processes inference tasks | - |
+| postgres | PostgreSQL - durable storage (source of truth) | 5432 |
+| redis | Redis - real-time cache + Celery broker | 6379 |
 | flower | Celery monitoring UI | 5555 |
 | pgadmin | PostgreSQL admin UI | 5050 |
 | redisinsight | Redis admin UI | 5540 |
@@ -17,61 +19,40 @@ An asynchronous task processing API with authentication, credit based inference 
 ## Quick Start
 
 ```bash
-# Start all services
 docker compose up --build -d
-
-# Verify all services are running
 docker compose ps
-
-# View logs (now in JSON format)
 docker compose logs -f web worker
 ```
 
-## Implementation (Production Hardening)
+---
 
-I optimized the infra specifically for Model Serving constraints and production reliability:
+# API Reference
 
-**Base Image:** Switched from alpine to `python:3.10-slim-bullseye`.
-> Alpine's musl library is incompatible with standard ML wheels (manylinux). slim ensures compatibility with NumPy/PyTorch without risky source compilations.
+## Authentication
 
-**Database Schema:** Replaced raw SQL scripts with Alembic migrations.
-> Production schemas evolve. Migrations provide version control, rollback capabilities, and zero-downtime deployments.
-
-**Worker Lifecycle:** Configured Celery with `worker_max_tasks_per_child=50` and `task_time_limit`.
-> ML inference could cause leaks memory (CUDA fragmentation). Recycling workers prevents OOM crashes; time limits prevent "zombie" tasks from deadlocking GPUs.
-
-**Observability:** Implemented Structlog and distributed tracing.
-> JSON logs are machine-readable for aggregation (Datadog/Splunk). The `X-Request-ID` is passed from API → Worker to trace requests across the distributed system.
-
-**Security:** Containers run as non-root user (`appuser`).
-> Adheres to least-privilege principles.
-
-**Database Engine:** Upgraded PostgreSQL from 10.5 (EOL) to 15.
-
-**Dependencies Added:**
-- `alembic` (Migrations)
-- `structlog` (Structured Logging)
-- `requests` & `httpx` (Integration Testing)
-- `greenlet` (Async SQLAlchemy support)
-
-## API Endpoints
-
-| Method | Endpoint | Auth | Description |
-|--------|----------|------|-------------|
-| GET | `/health` | No | Health check |
-| POST | `/task` | Bearer | Submit async task (costs 1 credit) |
-| GET | `/poll/{task_id}` | Bearer | Get task status/result |
-| POST | `/admin/credits` | Bearer (admin only) | Update user credits |
-
-### Authentication
-
-All authenticated endpoints require a Bearer token:
+**All endpoints except `/health` require Bearer token authentication.**
 
 ```bash
 curl -H "Authorization: Bearer <api_key>" http://localhost:8000/task
 ```
 
-### Submit a Task
+Requests without valid Bearer token return `401 Invalid API key`.
+
+## Endpoints
+
+| Method | Endpoint | Auth | Description |
+|--------|----------|------|-------------|
+| GET | `/health` | No | Health check (for load balancer) |
+| POST | `/task` | Bearer | Submit task (validates auth + credits + input) |
+| GET | `/poll/{task_id}` | Bearer | Get task status/result |
+| POST | `/admin/credits` | Bearer (admin) | Update user credits |
+
+### POST /task
+
+**Input Validation (all checked before queuing):**
+1. Bearer token present and valid (auth)
+2. User has available credits (credits)
+3. Input parameters `a` and `b` are valid integers (type check)
 
 ```bash
 curl -X POST http://localhost:8000/task \
@@ -80,182 +61,711 @@ curl -X POST http://localhost:8000/task \
   -d '{"a": 5, "b": 3}'
 ```
 
-Response:
-```json
-{"task_id": "6ac9ba3d-47d0-454a-a88f-42bd57cde0d2"}
-```
+**Responses:**
+- `202` - Task accepted: `{"task_id": "uuid"}`
+- `401` - Invalid API key
+- `402` - Insufficient credits
+- `422` - Invalid input parameters
 
-### Poll for Result
+### GET /poll/{task_id}
+
+**Optimized for speed:** Single Redis call returns task with ownership info. No separate auth lookup.
 
 ```bash
-curl http://localhost:8000/poll/6ac9ba3d-47d0-454a-a88f-42bd57cde0d2 \
+curl http://localhost:8000/poll/{task_id} \
   -H "Authorization: Bearer 550e8400-e29b-41d4-a716-446655440000"
 ```
 
-Response (pending):
-```json
-{"status": "pending", "result": null, "error_message": null}
-```
-
-Response (complete):
-```json
-{"status": "complete", "result": 8, "error_message": null}
-```
-
-### Update User Credits (Admin Only)
-
-```bash
-curl -X POST http://localhost:8000/admin/credits \
-  -H "Authorization: Bearer 123e4567-e89b-12d3-a456-426614174000" \
-  -H "Content-Type: application/json" \
-  -d '{"user_api_key": "550e8400-e29b-41d4-a716-446655440000", "credits": 1000}'
-```
+**Responses:**
+- `200` - `{"status": "pending|in_progress|complete|failed", "result": N, "error_message": null}`
+- `401` - Invalid API key
+- `404` - Task not found (or not owned by user)
 
 ## Test Users
 
-| Name | API Key | Initial Credits |
-|------|---------|-----------------|
+| Name | API Key | Credits |
+|------|---------|---------|
 | admin | `123e4567-e89b-12d3-a456-426614174000` | 1000 |
 | test_user1 | `550e8400-e29b-41d4-a716-446655440000` | 500 |
 | test_user2 | `c56a4180-65aa-42ec-a945-5fd21dec0538` | 250 |
 
-## Testing
+---
 
-### Integration Tests
+# System Architecture
 
-```bash
-# Runs inside the Docker network
-docker compose exec web python scripts/test_integration.py
+## Design Philosophy
+
+**Speed over everything.** Redis handles all hot-path operations. Postgres is only touched when durability is required.
+
+| Store | Role | When Used |
+|-------|------|-----------|
+| Redis | Real-time operations | Auth, credit checks, task status, polling |
+| Postgres | Durable record | Task persistence, credit finalization, crash recovery |
+
+**Clients never touch Redis or Postgres directly.** All requests go through the API layer, which handles consistency.
+
+---
+
+## Data Model
+
+### PostgreSQL (Durable Storage)
+
+**users**
+| Column | Type | Description |
+|--------|------|-------------|
+| api_key | VARCHAR(36) | PRIMARY KEY |
+| name | VARCHAR(255) | User name |
+| total_credits | INTEGER | Assigned by admin |
+| spent_credits | INTEGER | Consumed by completed tasks |
+
+`reserved_credits` is NOT stored in Postgres. It's derived from in-flight tasks: `SUM(credits_required) FROM tasks WHERE status IN ('pending', 'in_progress')`.
+
+**tasks**
+| Column | Type | Description |
+|--------|------|-------------|
+| id | VARCHAR(36) | PRIMARY KEY |
+| owner_api_key | VARCHAR(36) | FK → users.api_key |
+| a, b | INTEGER | Input parameters |
+| credits_required | INTEGER | Cost (always 1 for now) |
+| status | VARCHAR(20) | pending / in_progress / complete / failed |
+| result | INTEGER | Output (nullable) |
+| error_message | TEXT | Error details (nullable) |
+| created_at | TIMESTAMP | Creation time |
+| updated_at | TIMESTAMP | Last update |
+
+### Redis (Real-time Cache)
+
+**user:{api_key}** (Hash)
+| Field | Description |
+|-------|-------------|
+| name | User name |
+| total_credits | Assigned by admin |
+| reserved_credits | Held by in-flight tasks |
+| spent_credits | Consumed by completed tasks |
+
+`available = total_credits - reserved_credits - spent_credits`
+
+**task:{task_id}** (Hash)
+| Field | Description |
+|-------|-------------|
+| owner_api_key | For ownership check in single call |
+| a, b | Input parameters |
+| credits_required | Cost |
+| status | pending / in_progress / complete / failed |
+| result | Output (if complete) |
+| error_message | Error (if failed) |
+| reservation_id | Links to reservation record |
+
+**reservation:{reservation_id}** (Hash)
+| Field | Description |
+|-------|-------------|
+| user_key | Which user:{api_key} |
+| credits | Amount reserved |
+| task_id | Which task |
+
+**celery:task_queue** (List)
+| Field | Description |
+|-------|-------------|
+| task_id | Task identifier |
+| a, b | Input parameters |
+| reservation_id | For credit tracking |
+
+---
+
+## Credit Model
+
+```
+available_credits = total_credits - reserved_credits - spent_credits
 ```
 
-### Unit Tests
+**Flow:**
+1. **Task submitted** → Credits reserved (available → reserved)
+2. **Task succeeds** → Credits committed (reserved → spent)
+3. **Task fails** → Credits released (reserved → available)
 
-```bash
-docker compose exec web pytest tests/ -v
+**Users are only charged for successfully completed work.**
+
+---
+
+## Sequence Diagrams
+
+### 1. Task Submission (POST /task)
+
+All validation happens before queuing. Single atomic Redis operation for credit reservation.
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant API
+    participant Redis
+    participant Postgres
+
+    Client->>API: POST /task {a, b}<br/>Authorization: Bearer <api_key>
+
+    Note over API: STEP 1: Validate + Reserve (atomic Redis)
+
+    API->>Redis: Reserve 1 credit in user:{api_key}
+
+    Note over Redis: Lua script (atomic):<br/>1. Check user exists → 401 if not<br/>2. Check available >= 1 → 402 if not<br/>3. reserved_credits += 1<br/>4. Create reservation:{uuid}<br/>5. Return reservation_id
+
+    alt user not found
+        Redis-->>API: USER_NOT_FOUND
+        API-->>Client: 401 Invalid API key
+    else insufficient credits
+        Redis-->>API: INSUFFICIENT_CREDITS
+        API-->>Client: 402 Insufficient credits
+    else success
+        Redis-->>API: reservation_id
+    end
+
+    Note over API: STEP 2: Create task in Redis
+
+    API->>Redis: HSET task:{task_id} (includes owner_api_key)
+
+    Note over API: STEP 3: Persist to Postgres (sync)
+
+    API->>Postgres: INSERT INTO tasks
+    Postgres-->>API: OK
+
+    Note over API: If Postgres fails → rollback Redis → 500
+
+    Note over API: STEP 4: Queue to Celery
+
+    API->>Redis: LPUSH celery:task_queue
+
+    API-->>Client: 202 {task_id}
 ```
 
-### Manual Testing
+### 2. Poll for Result (GET /poll/{task_id})
 
-```bash
-docker compose exec web python scripts/submit_task.py
+**Optimized:** Single Redis call. Task hash contains `owner_api_key` for ownership check.
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant API
+    participant Redis
+    participant Postgres
+
+    Client->>API: GET /poll/{task_id}<br/>Authorization: Bearer <api_key>
+
+    Note over API: Single Redis call for task + ownership
+
+    API->>Redis: HGETALL task:{task_id}
+
+    alt found in Redis
+        Redis-->>API: {owner_api_key, status, result, ...}
+
+        alt owner_api_key != request api_key
+            API-->>Client: 404 Task not found
+        else owned by user
+            API-->>Client: 200 {status, result, error_message}
+        end
+    else not in Redis (old task or cache miss)
+        API->>Postgres: SELECT * FROM tasks WHERE id = ?
+
+        alt not found or wrong owner
+            API-->>Client: 404 Task not found
+        else found
+            API-->>Client: 200 {status, result, error_message}
+        end
+    end
 ```
 
-## Monitoring
+### 3. Worker Processing
 
-### Flower (Celery Tasks)
+**Postgres-first writes** for durability. Worker signals ready only after model loaded.
 
-- **URL:** http://localhost:5555
-- **Workers tab:** View worker status, processed/failed counts
-- **Tasks tab:** View task history, status, runtime, results
+```mermaid
+sequenceDiagram
+    participant Redis
+    participant Worker
+    participant Postgres
 
-### pgAdmin (PostgreSQL)
+    Note over Worker: Worker ready (model loaded)
 
-- **URL:** http://localhost:5050
-- **Login:** `admin@admin.com` / `admin`
-- **Setup connection:**
-  - Host: `postgres`
-  - Port: `5432`
-  - Username: `postgres`
-  - Password: `postgres`
+    Worker->>Redis: BRPOP celery:task_queue (blocking)
+    Redis-->>Worker: {task_id, a, b, reservation_id}
 
-### RedisInsight (Redis)
+    Note over Worker: Idempotency check
 
-- **URL:** http://localhost:5540
-- **Setup connection:**
-  - Host: `redis`
-  - Port: `6379`
+    Worker->>Postgres: SELECT status FROM tasks WHERE id = ?
 
-## Project Structure
+    alt already complete/failed
+        Note over Worker: Skip processing, fix Redis state
+        Worker->>Redis: Update task:{task_id} to match Postgres
+    else pending/in_progress
+        Note over Worker: Process task
+
+        Worker->>Postgres: UPDATE tasks SET status='in_progress'
+        Worker->>Redis: HSET task:{task_id} status=in_progress
+
+        Worker->>Worker: Compute result (a + b)
+
+        alt success
+            Note over Worker: Postgres FIRST (durable)
+            Worker->>Postgres: UPDATE tasks SET status='complete', result=N
+            Worker->>Postgres: UPDATE users SET spent_credits += 1
+
+            Note over Worker: Then Redis (fast reads)
+            Worker->>Redis: Commit credits (spent += 1, reserved -= 1)
+            Worker->>Redis: Delete reservation:{id}
+            Worker->>Redis: HSET task:{task_id} status=complete, result=N
+
+        else failure (final)
+            Worker->>Postgres: UPDATE tasks SET status='failed', error_message=...
+            Worker->>Redis: Release credits (reserved -= 1)
+            Worker->>Redis: Delete reservation:{id}
+            Worker->>Redis: HSET task:{task_id} status=failed
+        end
+    end
+```
+
+### 4. Admin Update Credits (POST /admin/credits)
+
+**Both stores updated synchronously.** If Redis update fails, request fails (prevents race condition).
+
+```mermaid
+sequenceDiagram
+    participant Admin
+    participant API
+    participant Redis
+    participant Postgres
+
+    Admin->>API: POST /admin/credits<br/>{user_api_key, credits: 1000}
+
+    API->>Redis: HGETALL user:{admin_api_key}
+
+    alt not admin
+        API-->>Admin: 403 Admin access required
+    end
+
+    Note over API: Update BOTH stores (sync)
+
+    API->>Postgres: UPDATE users SET total_credits = 1000
+    Postgres-->>API: OK
+
+    API->>Redis: HSET user:{target} total_credits = 1000
+
+    alt Redis fails
+        Note over API: Rollback Postgres? Or accept inconsistency?<br/>Current: Fail request, log for manual fix
+        API-->>Admin: 500 Credit update failed
+    else success
+        API-->>Admin: 200 Credits updated
+    end
+```
+
+---
+
+# Worker Configuration
+
+## AI Workload Considerations
+
+AI inference tasks have unique characteristics:
+
+| Characteristic | Challenge | Solution |
+|---------------|-----------|----------|
+| **Cold start** | Model loading takes 1-20 min | Warm pool, pre-baked images |
+| **Long-running** | Some tasks take minutes | No hard timeouts, soft limits |
+| **Short-running** | Some tasks take milliseconds | Batch processing, keep-warm |
+| **Memory intensive** | GPU memory fragmentation | Worker recycling |
+| **Variable duration** | p50 = 2s, p99 = 60s | Priority queues |
+
+## Worker Ready Signal
+
+Workers only accept tasks after heavy initialization completes:
+
+```python
+@celery_app.task(bind=True)
+def compute_task(self, task_id, a, b, reservation_id):
+    # This task only runs after worker signals ready
+    ...
+
+# In worker startup:
+@worker_ready.connect
+def on_worker_ready(sender, **kwargs):
+    # Model loading happens here
+    load_model_into_gpu()
+    logger.info("Worker ready, model loaded")
+```
+
+## Celery Configuration
+
+```python
+celery_app.conf.update(
+    # One task at a time (no prefetching)
+    worker_prefetch_multiplier=1,
+
+    # Acknowledge after completion (reliability)
+    task_acks_late=True,
+
+    # Requeue if worker dies
+    task_reject_on_worker_lost=True,
+
+    # Recycle workers to prevent memory leaks
+    worker_max_tasks_per_child=50,
+
+    # Soft timeout (allows graceful shutdown)
+    task_soft_time_limit=300,
+
+    # Hard timeout (kills stuck tasks)
+    task_time_limit=330,
+
+    # Retry with exponential backoff
+    task_default_retry_delay=1,
+    task_max_retries=3,
+)
+```
+
+## Task Failure Handling
+
+| Failure Type | Behavior |
+|--------------|----------|
+| Exception in task | Retry with backoff (up to 3 times) |
+| Max retries exceeded | Mark failed, release credits, log error |
+| Worker crash mid-task | Task requeued (acks_late=True), idempotency check prevents duplicate work |
+| Redis unavailable | Postgres write succeeds, Redis update logged as warning, self-heals on sync |
+
+## Celery Disconnect Handling
+
+```python
+@celery_app.task(bind=True)
+def compute_task(self, task_id, ...):
+    try:
+        # ... task logic ...
+    except redis.ConnectionError:
+        # Redis down - Postgres is source of truth
+        logger.warning(f"Redis unavailable, Postgres updated")
+        # Task completes, Redis will sync on recovery
+```
+
+---
+
+# Logging & Observability
+
+## Structured Logging
+
+All logs are JSON for aggregation (Datadog, Splunk, ELK):
+
+```json
+{
+  "timestamp": "2024-01-15T10:30:00Z",
+  "level": "info",
+  "message": "Task completed",
+  "request_id": "abc-123",
+  "task_id": "def-456",
+  "user": "test_user1",
+  "duration_ms": 2150,
+  "result": 8
+}
+```
+
+## Distributed Tracing
+
+`X-Request-ID` header propagates through the system:
+
+```
+Client → API (generates request_id)
+         → Redis (logged)
+         → Postgres (logged)
+         → Celery (passed in task args)
+              → Worker (logged with same request_id)
+```
+
+## Key Metrics
+
+| Metric | Type | Alert Threshold |
+|--------|------|-----------------|
+| `task_queue_depth` | Gauge | > 1000 for 5 min |
+| `task_duration_seconds` | Histogram | p99 > 60s |
+| `credit_operations_total` | Counter | error_rate > 5% |
+| `redis_connection_errors` | Counter | > 10/min |
+| `worker_utilization` | Gauge | < 20% (over-provisioned) |
+
+---
+
+# Kubernetes Migration
+
+## Architecture on K8s
+
+```
+                    ┌─────────────────┐
+                    │  Ingress / LB   │
+                    └────────┬────────┘
+                             │
+              ┌──────────────┼──────────────┐
+              │              │              │
+        ┌─────▼─────┐  ┌─────▼─────┐  ┌─────▼─────┐
+        │  API Pod  │  │  API Pod  │  │  API Pod  │
+        │ (FastAPI) │  │ (FastAPI) │  │ (FastAPI) │
+        └─────┬─────┘  └─────┬─────┘  └─────┬─────┘
+              │              │              │
+              └──────────────┼──────────────┘
+                             │
+              ┌──────────────┼──────────────┐
+              │              │              │
+        ┌─────▼─────┐  ┌─────▼─────┐  ┌─────▼─────┐
+        │  Redis    │  │ Postgres  │  │  Worker   │
+        │ (Primary) │  │ (Primary) │  │   Pods    │
+        └───────────┘  └───────────┘  └───────────┘
+```
+
+## Minikube Setup
+
+```bash
+# Start minikube with enough resources
+minikube start --cpus=4 --memory=8192
+
+# Enable ingress
+minikube addons enable ingress
+
+# Deploy
+kubectl apply -f k8s/
+```
+
+## Autoscaling (HPA)
+
+**API Pods:** Scale on CPU (standard web traffic)
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: api-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: api
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+```
+
+**Worker Pods:** Scale on queue depth (custom metric)
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: worker-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: worker
+  minReplicas: 2
+  maxReplicas: 20
+  metrics:
+  - type: External
+    external:
+      metric:
+        name: celery_queue_depth
+      target:
+        type: AverageValue
+        averageValue: 10  # Scale up when > 10 tasks per worker
+```
+
+## Network Bottlenecks
+
+| Bottleneck | Symptom | Solution |
+|------------|---------|----------|
+| Redis connections | Connection timeouts | Connection pooling per pod, Redis Cluster |
+| Postgres connections | "too many connections" | PgBouncer sidecar or separate deployment |
+| Inter-pod latency | Slow Redis calls | Same-node affinity for Redis-heavy pods |
+| Ingress throughput | 503 errors | Multiple ingress replicas, rate limiting |
+
+### Connection Pooling
+
+Each API pod maintains its own connection pool:
+
+```python
+# Per-pod Redis pool
+redis_pool = redis.ConnectionPool(
+    host=REDIS_HOST,
+    max_connections=20,  # Per pod
+    socket_timeout=1.0,
+    socket_connect_timeout=1.0,
+)
+
+# Per-pod Postgres pool (via asyncpg)
+db_pool = await asyncpg.create_pool(
+    dsn=DATABASE_URL,
+    min_size=5,
+    max_size=20,  # Per pod
+)
+```
+
+**Why per-pod?** Sharing pools across pods requires external poolers (PgBouncer, Redis Cluster). Per-pod pools are simpler and sufficient for moderate scale.
+
+---
+
+# Multi-Region Deployment
+
+## High-Level Architecture
+
+```
+                US-EAST                                    EU-WEST
+    ┌─────────────────────────────┐          ┌─────────────────────────────┐
+    │                             │          │                             │
+    │  ┌─────────┐  ┌─────────┐   │          │  ┌─────────┐  ┌─────────┐   │
+    │  │   API   │  │   API   │   │          │  │   API   │  │   API   │   │
+    │  └────┬────┘  └────┬────┘   │          │  └────┬────┘  └────┬────┘   │
+    │       │            │        │          │       │            │        │
+    │  ┌────▼────────────▼────┐   │          │  ┌────▼────────────▼────┐   │
+    │  │     Redis (Local)    │   │          │  │     Redis (Local)    │   │
+    │  └──────────────────────┘   │          │  └──────────────────────┘   │
+    │                             │          │                             │
+    │  ┌──────────────────────┐   │          │  ┌──────────────────────┐   │
+    │  │  Workers (GPU)       │   │          │  │  Workers (GPU)       │   │
+    │  └──────────────────────┘   │          │  └──────────────────────┘   │
+    │                             │          │                             │
+    └──────────────┬──────────────┘          └──────────────┬──────────────┘
+                   │                                        │
+                   │         ┌──────────────────┐           │
+                   └─────────┤ Postgres Primary ├───────────┘
+                             │    (US-EAST)     │
+                             └────────┬─────────┘
+                                      │
+                             ┌────────▼─────────┐
+                             │ Postgres Replica │
+                             │    (EU-WEST)     │
+                             └──────────────────┘
+```
+
+## Database Strategy
+
+**Single Primary + Read Replicas** (simpler than multi-primary)
+
+| Operation | Where | Latency Impact |
+|-----------|-------|----------------|
+| Reads (poll) | Local replica | ~5ms |
+| Writes (task submit) | Cross-region to primary | +100-150ms |
+| Credit updates | Cross-region to primary | +100-150ms |
+
+**Why not multi-primary?** Conflict resolution is complex. Credit operations need strong consistency. Cross-region write latency is acceptable for async task submission.
+
+## Redis Strategy
+
+**Local Redis per region.** Each region's Redis is independent.
+
+| Challenge | Solution |
+|-----------|----------|
+| User submits in US, polls in EU | Embed region hint in task_id (e.g., `us-east:uuid`) |
+| Redis state divergence | Each region rebuilds from Postgres on startup |
+| Cache invalidation | Admin credit updates go to all regions (fan-out) |
+
+## Latency Tradeoffs
+
+| Scenario | US-EAST User | EU-WEST User |
+|----------|--------------|--------------|
+| Submit task | ~50ms (local) | ~150ms (cross-region write) |
+| Poll result | ~10ms (local Redis) | ~10ms (local Redis) |
+| Admin update | ~50ms | ~150ms |
+
+**Key insight:** Task submission latency matters less for async workloads. Users wait for results anyway.
+
+## Failover
+
+| Component | Strategy | RTO |
+|-----------|----------|-----|
+| Postgres | Streaming replication, automatic failover | < 30s |
+| Redis | Accept ephemeral, rebuild from Postgres | < 60s |
+| Region | DNS failover to healthy region | < 5 min |
+
+---
+
+# Implementation Checklist
+
+## Core (Must Have)
+- [ ] Credit logic: reserve → commit/release
+- [ ] Distributed caching: user + task in Redis
+- [ ] Input validation: auth + credits + types before queue
+- [ ] Rollback on failure at any step
+
+## Worker (Must Have)
+- [ ] Redis task backend
+- [ ] Failure handling with retry
+- [ ] Celery disconnect handling
+- [ ] Ready signal after model load
+- [ ] One task at a time (prefetch=1)
+
+## Observability (Should Have)
+- [ ] Structured JSON logging
+- [ ] Distributed tracing (X-Request-ID)
+- [ ] Key metrics exposed
+
+## Kubernetes (Discussion + Demo if time)
+- [ ] Deployment manifests
+- [ ] HPA for API (CPU-based)
+- [ ] HPA for Workers (queue depth)
+- [ ] Network/connection pooling strategy
+
+## Multi-Region (Discussion Only)
+- [ ] Architecture diagram
+- [ ] Database replication strategy
+- [ ] Redis per region approach
+- [ ] Latency tradeoffs understood
+
+---
+
+# Project Structure
 
 ```
 .
-├── compose.yaml              # Docker Compose configuration
+├── compose.yaml
+├── k8s/                      # Kubernetes manifests
+│   ├── api-deployment.yaml
+│   ├── worker-deployment.yaml
+│   ├── redis-deployment.yaml
+│   ├── postgres-deployment.yaml
+│   └── hpa.yaml
 ├── api/
-│   ├── Dockerfile            # Debian-slim based image
+│   ├── Dockerfile
 │   ├── alembic/              # Database migrations
-│   ├── requirements.txt      # Python dependencies
-│   ├── main.py               # FastAPI application entrypoint
-│   ├── config.py             # Environment configuration
-│   ├── logger.py             # Structlog configuration
-│   ├── celery_app.py         # Celery configuration
-│   ├── worker/               # Celery worker tasks
-│   └── ...
+│   ├── main.py               # FastAPI app + startup sync
+│   ├── config.py
+│   ├── logger.py             # Structlog setup
+│   ├── celery_app.py
+│   ├── models/
+│   ├── routes/
+│   ├── services/
+│   │   ├── auth_service.py
+│   │   ├── task_service.py
+│   │   └── redis_service.py  # NEW: atomic Redis ops
+│   ├── repositories/
+│   └── worker/
+│       └── tasks.py
 └── ...
 ```
 
-## Design Decisions
+---
 
-### Reducing Database Calls
-
-The assignment asked: *"Assuming the database calls are too expensive, how can we reduce the number of calls?"*
-
-**Solution:** Cache-aside pattern with Redis
-
-1. On authentication, check Redis cache first
-2. On cache miss, query Postgres and cache result (TTL: 15s)
-3. On admin credit update, invalidate cache immediately
-
-This reduces database queries by ~90% for repeat requests within the TTL window.
-
-> See `api/services/auth_service.py` for implementation.
-
-### Atomic Credit Deduction
-
-Credits are deducted atomically using a single SQL statement with a WHERE clause:
-
-```sql
-UPDATE users SET credits = credits - 1
-WHERE api_key = $1 AND credits >= 1
-RETURNING credits
-```
-
-This prevents race conditions where two concurrent requests could both succeed with only 1 credit remaining.
-
-### Task Ownership
-
-When polling, users can only see their own tasks. We return `404` (not `403`) for tasks owned by others to avoid leaking task existence information.
-
-### Celery Configuration
-
-- **`acks_late=True`:** Acknowledge tasks after completion (not on receive) for reliability
-- **`worker_prefetch_multiplier=1`:** Fair distribution for long-running tasks
-- **`max_retries=3` with `retry_backoff=True`:** Automatic retry with exponential backoff
-
-## Operations
-
-### View Logs
+# Testing
 
 ```bash
-# All services
-docker compose logs -f
+# Unit tests
+docker compose exec web pytest tests/ -v
 
-# Specific services
-docker compose logs -f web worker
+# Integration tests
+docker compose exec web python scripts/test_integration.py
+
+# Load test (queue depth demo)
+docker compose exec web python scripts/load_test.py --tasks 100
 ```
 
-### Database Operations
+---
 
-```bash
-# Connect to Postgres
-docker compose exec postgres psql -U postgres -d postgres
-```
+# Monitoring
 
-### Reset Everything
-
-```bash
-docker compose down -v
-rm -rf postgres-data
-docker compose up --build -d
-```
-
-## Production Roadmap
-
-To scale this system to handle high traffic, the following enhancements should be prioritized:
-
-1. **Expose Prometheus metrics** for auto-scaling, health monitoring, dependency status and associated latencies (e.g., `http_request_duration_seconds` histogram, `active_inference_workers` count).
-
-2. **Implement alerts based on SLAs** to detect degradation or invalid system behavior.
-
-3. **Distributed tracing visualization.**
-
-4. **Rate limit users** to protect against abuse.
+| Service | URL | Purpose |
+|---------|-----|---------|
+| Flower | http://localhost:5555 | Celery task monitoring |
+| pgAdmin | http://localhost:5050 | PostgreSQL admin |
+| RedisInsight | http://localhost:5540 | Redis admin |
