@@ -4,7 +4,7 @@ Unit tests for UserRepository.
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from repositories.user_repository import UserRepository
-from models.domain import User
+from models.schemas import User
 
 
 class TestUserRepository:

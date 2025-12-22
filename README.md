@@ -99,10 +99,41 @@ curl http://localhost:8000/poll/{task_id} \
 
 | Store | Role | When Used |
 |-------|------|-----------|
-| Redis | Real-time operations | Auth, credit checks, task status, polling |
-| Postgres | Durable record | Task persistence, credit finalization, crash recovery |
+| Redis | Shared cache (external) | Auth, credit checks, task status, polling |
+| Postgres | Source of truth | Task persistence, credit finalization, recovery |
 
-**Clients never touch Redis or Postgres directly.** All requests go through the API layer, which handles consistency.
+**Key architecture points:**
+- Redis is **shared and external** - all API pods connect to the same Redis instance
+- All requests go through the API layer (clients never touch Redis/Postgres directly)
+- On Redis miss → fallback to Postgres → populate Redis (cache-aside)
+
+---
+
+## Redis/Postgres Consistency
+
+**Q: What if user is in Postgres but not in Redis?**
+
+Auth flow handles this automatically:
+1. Check Redis for user → miss
+2. Query Postgres → found
+3. Populate Redis with user data
+4. Continue with request
+
+**Q: When does startup sync run?**
+
+Only for **recovery** (Redis empty/crashed):
+```
+API starts → if user not in Redis → sync from Postgres
+```
+During normal operation, Redis already has data. New pods don't re-sync.
+
+**Q: How are writes kept consistent?**
+
+| Operation | Write Order | Rollback if fail? |
+|-----------|-------------|-------------------|
+| Task submit | Redis first (reserve), then Postgres | Yes, rollback Redis |
+| Task complete | Postgres first, then Redis | No (Postgres is truth) |
+| Admin credit update | Postgres first, then Redis | Fail request if Redis fails |
 
 ---
 
@@ -191,7 +222,7 @@ available_credits = total_credits - reserved_credits - spent_credits
 
 ### 1. Task Submission (POST /task)
 
-All validation happens before queuing. Single atomic Redis operation for credit reservation.
+Auth checks Redis first, falls back to Postgres. Credit reservation is atomic in Redis.
 
 ```mermaid
 sequenceDiagram
@@ -202,34 +233,48 @@ sequenceDiagram
 
     Client->>API: POST /task {a, b}<br/>Authorization: Bearer <api_key>
 
-    Note over API: STEP 1: Validate + Reserve (atomic Redis)
+    Note over API: STEP 1: Authenticate user
 
-    API->>Redis: Reserve 1 credit in user:{api_key}
+    API->>Redis: HGETALL user:{api_key}
 
-    Note over Redis: Lua script (atomic):<br/>1. Check user exists → 401 if not<br/>2. Check available >= 1 → 402 if not<br/>3. reserved_credits += 1<br/>4. Create reservation:{uuid}<br/>5. Return reservation_id
+    alt user in Redis
+        Redis-->>API: {name, total_credits, spent_credits, reserved_credits}
+    else user NOT in Redis
+        Redis-->>API: nil
+        API->>Postgres: SELECT * FROM users WHERE api_key = ?
+        alt user in Postgres
+            Postgres-->>API: user row
+            API->>Redis: HSET user:{api_key} (populate cache)
+        else user not found anywhere
+            API-->>Client: 401 Invalid API key
+        end
+    end
 
-    alt user not found
-        Redis-->>API: USER_NOT_FOUND
-        API-->>Client: 401 Invalid API key
-    else insufficient credits
+    Note over API: STEP 2: Reserve credits (atomic Lua script)
+
+    API->>Redis: Reserve 1 credit for user:{api_key}
+
+    Note over Redis: Lua script checks:<br/>if available < 1 → 402<br/>else reserved += 1, create reservation
+
+    alt insufficient credits
         Redis-->>API: INSUFFICIENT_CREDITS
         API-->>Client: 402 Insufficient credits
     else success
         Redis-->>API: reservation_id
     end
 
-    Note over API: STEP 2: Create task in Redis
+    Note over API: STEP 3: Create task in Redis
 
-    API->>Redis: HSET task:{task_id} (includes owner_api_key)
+    API->>Redis: HSET task:{task_id}
 
-    Note over API: STEP 3: Persist to Postgres (sync)
+    Note over API: STEP 4: Persist to Postgres
 
     API->>Postgres: INSERT INTO tasks
     Postgres-->>API: OK
 
     Note over API: If Postgres fails → rollback Redis → 500
 
-    Note over API: STEP 4: Queue to Celery
+    Note over API: STEP 5: Queue to Celery
 
     API->>Redis: LPUSH celery:task_queue
 

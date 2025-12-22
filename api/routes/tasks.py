@@ -1,10 +1,10 @@
 from fastapi import APIRouter, Depends, HTTPException
-from models.domain import User
+from models.schemas import User
 from models.requests import TaskRequest
 from models.responses import TaskResponse, PollResponse
 from services.task_service import TaskService
 from dependencies import get_current_user, get_task_service
-from exceptions import InsufficientCreditsError, TaskNotFoundError
+from exceptions import InsufficientCreditsError, TaskNotFoundError, InvalidApiKeyError
 
 router = APIRouter()
 
@@ -17,14 +17,21 @@ async def create_task(
 ):
     """
     Submit a task for async processing.
-    
-    Requires valid Bearer token and at least 1 credit.
+
+    Validates (all before queuing):
+    1. Bearer token present and valid (auth)
+    2. User has available credits
+    3. Input parameters a and b are valid integers
+
+    Returns 202 with task_id on success.
     """
     try:
         task_id = await task_service.submit_task(user, request.a, request.b)
         return TaskResponse(task_id=task_id)
     except InsufficientCreditsError:
         raise HTTPException(status_code=402, detail="Insufficient credits")
+    except InvalidApiKeyError:
+        raise HTTPException(status_code=401, detail="Invalid API key")
 
 
 @router.get("/poll/{task_id}", response_model=PollResponse)

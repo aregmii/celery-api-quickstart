@@ -1,25 +1,24 @@
-import redis
+"""
+FastAPI dependency injection.
+
+All services are wired through app.state for proper lifecycle management.
+"""
 from fastapi import Request, Depends, HTTPException
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from repositories.user_repository import UserRepository
 from repositories.task_repository import TaskRepository
 from services.auth_service import AuthService
 from services.task_service import TaskService
-from models.domain import User
-from config import settings
+from services.redis_service import RedisService
+from models.schemas import User
 from exceptions import InvalidApiKeyError
 
 security = HTTPBearer()
 
 
-def get_redis() -> redis.Redis:
-    """Get Redis connection."""
-    return redis.Redis(
-        host=settings.redis_host,
-        port=settings.redis_port,
-        db=settings.redis_db,
-        decode_responses=True
-    )
+def get_redis_service(request: Request) -> RedisService:
+    """Get RedisService instance from app state."""
+    return request.app.state.redis_service
 
 
 def get_user_repo(request: Request) -> UserRepository:
@@ -33,20 +32,19 @@ def get_task_repo(request: Request) -> TaskRepository:
 
 
 def get_auth_service(
-    cache: redis.Redis = Depends(get_redis),
+    redis_service: RedisService = Depends(get_redis_service),
     user_repo: UserRepository = Depends(get_user_repo)
 ) -> AuthService:
     """Get AuthService instance."""
-    return AuthService(cache, user_repo)
+    return AuthService(redis_service, user_repo)
 
 
 def get_task_service(
-    user_repo: UserRepository = Depends(get_user_repo),
     task_repo: TaskRepository = Depends(get_task_repo),
-    auth_service: AuthService = Depends(get_auth_service)
+    redis_service: RedisService = Depends(get_redis_service)
 ) -> TaskService:
     """Get TaskService instance."""
-    return TaskService(user_repo, task_repo, auth_service)
+    return TaskService(task_repo, redis_service)
 
 
 async def get_current_user(
@@ -55,7 +53,7 @@ async def get_current_user(
 ) -> User:
     """
     Dependency that validates bearer token and returns current user.
-    
+
     Raises HTTPException 401 if invalid API key.
     """
     try:

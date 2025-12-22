@@ -3,7 +3,7 @@ Pytest fixtures for unit tests.
 """
 import pytest
 from unittest.mock import AsyncMock, MagicMock
-from models.domain import User, Task
+from models.schemas import User, Task
 
 
 @pytest.fixture

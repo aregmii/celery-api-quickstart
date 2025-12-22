@@ -5,7 +5,7 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock
 from services.auth_service import AuthService
 from repositories.user_repository import UserRepository
-from models.domain import User
+from models.schemas import User
 from exceptions import InvalidApiKeyError
 
 

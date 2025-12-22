@@ -7,7 +7,7 @@ from services.task_service import TaskService
 from repositories.user_repository import UserRepository
 from repositories.task_repository import TaskRepository
 from services.auth_service import AuthService
-from models.domain import User, Task
+from models.schemas import User, Task
 from exceptions import InsufficientCreditsError, TaskNotFoundError
 
 
