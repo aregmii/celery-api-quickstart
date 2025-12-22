@@ -179,7 +179,7 @@ curl http://localhost:8000/poll/{task_id} \
 
 ### 1. Task Submission (POST /task)
 
-Auth checks Redis first, falls back to Postgres. Credit reservation is atomic in Redis.
+Auth checks Redis first, falls back to Postgres. Credit reservation is atomic via Lua script.
 
 ```mermaid
 sequenceDiagram
@@ -188,33 +188,33 @@ sequenceDiagram
     participant Redis
     participant Postgres
 
-    Client->>API: POST /task {a, b}<br/>Authorization: Bearer <api_key>
+    Client->>API: POST /task {a, b} with Bearer token
 
     Note over API: STEP 1: Authenticate user
 
-    API->>Redis: HGETALL user:{api_key}
+    API->>Redis: Get user by api_key
 
-    alt user in Redis
-        Redis-->>API: {name, total_credits, spent_credits, reserved_credits}
-    else user NOT in Redis
-        Redis-->>API: nil
-        API->>Postgres: SELECT * FROM users WHERE api_key = ?
-        alt user in Postgres
-            Postgres-->>API: user row
-            API->>Redis: HSET user:{api_key} (populate cache)
-        else user not found anywhere
+    alt user found in Redis
+        Redis-->>API: User data (name, credits, etc.)
+    else user NOT in Redis (cache miss)
+        Redis-->>API: Not found
+        API->>Postgres: Query user by api_key
+        alt user exists in Postgres
+            Postgres-->>API: User row
+            API->>Redis: Cache user data
+        else user not found
             API-->>Client: 401 Invalid API key
         end
     end
 
     Note over API: STEP 2: Reserve credits (atomic Lua script)
 
-    API->>Redis: Reserve 1 credit for user:{api_key}
+    API->>Redis: Reserve 1 credit (Lua script)
 
-    Note over Redis: Lua script checks:<br/>if available < 1 → 402<br/>else reserved += 1, create reservation
+    Note over Redis: Lua script atomically:<br/>1. Check available >= 1<br/>2. Increment reserved_credits<br/>3. Create reservation record
 
     alt insufficient credits
-        Redis-->>API: INSUFFICIENT_CREDITS
+        Redis-->>API: Error: insufficient credits
         API-->>Client: 402 Insufficient credits
     else success
         Redis-->>API: reservation_id
@@ -222,25 +222,25 @@ sequenceDiagram
 
     Note over API: STEP 3: Create task in Redis
 
-    API->>Redis: HSET task:{task_id}
+    API->>Redis: Store task data (status=pending)
 
     Note over API: STEP 4: Persist to Postgres
 
-    API->>Postgres: INSERT INTO tasks
+    API->>Postgres: Insert task row
     Postgres-->>API: OK
 
     Note over API: If Postgres fails → rollback Redis → 500
 
     Note over API: STEP 5: Queue to Celery
 
-    API->>Redis: LPUSH celery:task_queue
+    API->>Redis: Push task to Celery queue
 
     API-->>Client: 202 {task_id}
 ```
 
 ### 2. Poll for Result (GET /poll/{task_id})
 
-**Optimized:** Single Redis call. Task hash contains `owner_api_key` for ownership check.
+**Optimized:** Single Redis call returns task with owner for ownership check.
 
 ```mermaid
 sequenceDiagram
@@ -249,26 +249,24 @@ sequenceDiagram
     participant Redis
     participant Postgres
 
-    Client->>API: GET /poll/{task_id}<br/>Authorization: Bearer <api_key>
+    Client->>API: GET /poll/{task_id} with Bearer token
 
-    Note over API: Single Redis call for task + ownership
+    API->>Redis: Get task by task_id
 
-    API->>Redis: HGETALL task:{task_id}
+    alt task found in Redis
+        Redis-->>API: Task data (owner, status, result, etc.)
 
-    alt found in Redis
-        Redis-->>API: {owner_api_key, status, result, ...}
-
-        alt owner_api_key != request api_key
+        alt owner doesn't match request api_key
             API-->>Client: 404 Task not found
-        else owned by user
+        else owner matches
             API-->>Client: 200 {status, result, error_message}
         end
-    else not in Redis (old task or cache miss)
-        API->>Postgres: SELECT * FROM tasks WHERE id = ?
+    else task not in Redis (cache miss)
+        API->>Postgres: Query task by id
 
         alt not found or wrong owner
             API-->>Client: 404 Task not found
-        else found
+        else found and owned
             API-->>Client: 200 {status, result, error_message}
         end
     end
@@ -276,7 +274,7 @@ sequenceDiagram
 
 ### 3. Worker Processing
 
-**Postgres-first writes** for durability. Worker signals ready only after model loaded.
+**Postgres-first writes** for durability. Worker processes one task at a time.
 
 ```mermaid
 sequenceDiagram
@@ -286,46 +284,46 @@ sequenceDiagram
 
     Note over Worker: Worker ready (model loaded)
 
-    Worker->>Redis: BRPOP celery:task_queue (blocking)
-    Redis-->>Worker: {task_id, a, b, reservation_id}
+    Worker->>Redis: Wait for task from queue (blocking)
+    Redis-->>Worker: Task data (task_id, a, b, reservation_id)
 
     Note over Worker: Idempotency check
 
-    Worker->>Postgres: SELECT status FROM tasks WHERE id = ?
+    Worker->>Postgres: Get task status
 
-    alt already complete/failed
-        Note over Worker: Skip processing, fix Redis state
-        Worker->>Redis: Update task:{task_id} to match Postgres
-    else pending/in_progress
+    alt already complete or failed
+        Note over Worker: Skip processing
+        Worker->>Redis: Sync task status to Redis
+    else pending or in_progress
         Note over Worker: Process task
 
-        Worker->>Postgres: UPDATE tasks SET status='in_progress'
-        Worker->>Redis: HSET task:{task_id} status=in_progress
+        Worker->>Postgres: Set status = in_progress
+        Worker->>Redis: Set status = in_progress
 
         Worker->>Worker: Compute result (a + b)
 
         alt success
             Note over Worker: Postgres FIRST (durable)
-            Worker->>Postgres: UPDATE tasks SET status='complete', result=N
-            Worker->>Postgres: UPDATE users SET spent_credits += 1
+            Worker->>Postgres: Set status = complete, result = N
+            Worker->>Postgres: Increment user spent_credits
 
             Note over Worker: Then Redis (fast reads)
-            Worker->>Redis: Commit credits (spent += 1, reserved -= 1)
-            Worker->>Redis: Delete reservation:{id}
-            Worker->>Redis: HSET task:{task_id} status=complete, result=N
+            Worker->>Redis: Commit credits (reserved → spent)
+            Worker->>Redis: Delete reservation
+            Worker->>Redis: Set status = complete, result = N
 
-        else failure (final)
-            Worker->>Postgres: UPDATE tasks SET status='failed', error_message=...
-            Worker->>Redis: Release credits (reserved -= 1)
-            Worker->>Redis: Delete reservation:{id}
-            Worker->>Redis: HSET task:{task_id} status=failed
+        else failure (after max retries)
+            Worker->>Postgres: Set status = failed, error_message
+            Worker->>Redis: Rollback credits (release reserved)
+            Worker->>Redis: Delete reservation
+            Worker->>Redis: Set status = failed
         end
     end
 ```
 
 ### 4. Admin Update Credits (POST /admin/credits)
 
-**Both stores updated synchronously.** If Redis update fails, request fails (prevents race condition).
+**Both stores updated synchronously.** If Redis fails after Postgres, request fails.
 
 ```mermaid
 sequenceDiagram
@@ -334,23 +332,23 @@ sequenceDiagram
     participant Redis
     participant Postgres
 
-    Admin->>API: POST /admin/credits<br/>{user_api_key, credits: 1000}
+    Admin->>API: POST /admin/credits {user_api_key, credits: 1000}
 
-    API->>Redis: HGETALL user:{admin_api_key}
+    API->>Redis: Get admin user data
 
-    alt not admin
+    alt not admin user
         API-->>Admin: 403 Admin access required
     end
 
-    Note over API: Update BOTH stores (sync)
+    Note over API: Update BOTH stores
 
-    API->>Postgres: UPDATE users SET total_credits = 1000
+    API->>Postgres: Update user total_credits = 1000
     Postgres-->>API: OK
 
-    API->>Redis: HSET user:{target} total_credits = 1000
+    API->>Redis: Update user total_credits = 1000
 
-    alt Redis fails
-        Note over API: Rollback Postgres? Or accept inconsistency?<br/>Current: Fail request, log for manual fix
+    alt Redis update fails
+        Note over API: Postgres updated but Redis failed<br/>Fail request to signal inconsistency
         API-->>Admin: 500 Credit update failed
     else success
         API-->>Admin: 200 Credits updated
