@@ -1,1 +1,7 @@
 /postgres-data
+__pycache__/
+*.pyc
+postgres-data/
+*.zip
+*.ini
+*.impl

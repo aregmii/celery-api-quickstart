@@ -1,52 +1,47 @@
 import asyncio
-from contextlib import asynccontextmanager
+import uuid
 import asyncpg
-from fastapi import FastAPI
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, Request
+from starlette.middleware.base import BaseHTTPMiddleware
+
 from config import settings
-from logger import get_logger
+from logger import configure_logging, get_logger, request_id_ctx
 from routes import router
 
+configure_logging()
 logger = get_logger(__name__)
 
+class RequestIDMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        request_id = str(uuid.uuid4())
+        request_id_ctx.set(request_id)
+        response = await call_next(request)
+        response.headers["X-Request-ID"] = request_id
+        return response
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Application startup and shutdown."""
-    logger.info("Starting up...")
-    
-    # Create database connection pool with retry
-    max_retries = 10
-    for attempt in range(max_retries):
-        try:
-            app.state.db_pool = await asyncpg.create_pool(
-                host=settings.database_host,
-                port=settings.database_port,
-                user=settings.database_user,
-                password=settings.database_password,
-                database=settings.database_name,
-                min_size=settings.database_pool_min_size,
-                max_size=settings.database_pool_max_size,
-            )
-            logger.info("Database pool created")
-            break
-        except Exception as e:
-            if attempt < max_retries - 1:
-                logger.warning(f"Database not ready, retrying in 2s... ({attempt + 1}/{max_retries})")
-                await asyncio.sleep(2)
-            else:
-                logger.error(f"Failed to connect to database: {e}")
-                raise
+    logger.info("startup", message="Starting application...")
+    try:
+        app.state.db_pool = await asyncpg.create_pool(
+            host=settings.database_host,
+            port=settings.database_port,
+            user=settings.database_user,
+            password=settings.database_password,
+            database=settings.database_name,
+            min_size=1,
+            max_size=10,
+        )
+    except Exception as e:
+        logger.error("db_connection_failed", error=str(e))
+        raise e
     
     yield
     
     await app.state.db_pool.close()
-    logger.info("Shutdown complete")
+    logger.info("shutdown", message="Application shutdown complete")
 
-
-app = FastAPI(
-    title="Task API",
-    description="Async task processing with authentication and billing",
-    lifespan=lifespan,
-)
-
+app = FastAPI(title="Task API", lifespan=lifespan)
+app.add_middleware(RequestIDMiddleware)
 app.include_router(router)

@@ -1,9 +1,15 @@
 fastapi
-redis
 uvicorn[standard]
-celery[redis]
 asyncpg
+sqlalchemy
+alembic
+greenlet
+celery[redis]
+redis
 pydantic
 pydantic-settings
+structlog
 pytest
 pytest-asyncio
+httpx
+requests

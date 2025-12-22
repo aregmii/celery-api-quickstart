@@ -1,8 +1,14 @@
 services:
   redis:
     image: "redis:alpine"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
 
   postgres:
+    # Upgraded from 10.5 (EOL) to 15
     image: postgres:15
     restart: always
     environment:
@@ -12,14 +18,42 @@ services:
       - '5432:5432'
     volumes:
       - ./postgres-data:/var/lib/postgresql/data
-      - ./sql/create_tables.sql:/docker-entrypoint-initdb.d/create_tables.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
 
-  redisinsight:
-    image: redis/redisinsight:latest
+  web:
+    build: api/
+    # Run migrations before starting app
+    command: >
+      sh -c "alembic upgrade head && 
+             uvicorn main:app --host 0.0.0.0 --port 8000"
     ports:
-      - "5540:5540"
+      - "8000:8000"
     depends_on:
-      - redis
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/postgres
+      - REDIS_URL=redis://redis:6379/0
+      - LOG_LEVEL=INFO
+
+  worker:
+    build: api/
+    command: celery -A celery_app worker --loglevel=info --concurrency=4
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/postgres
+      - REDIS_URL=redis://redis:6379/0
+      - LOG_LEVEL=INFO
 
   flower:
     image: mher/flower
@@ -28,34 +62,3 @@ services:
       - "5555:5555"
     depends_on:
       - redis
-
-  web:
-    build: api/
-    ports:
-      - "8000:8000"
-    depends_on:
-      - redis
-      - postgres
-    environment:
-      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/postgres
-      - REDIS_URL=redis://redis:6379/0
-
-  worker:
-    build: api/
-    command: celery -A celery_app worker --loglevel=info --concurrency=4
-    depends_on:
-      - redis
-      - postgres
-    environment:
-      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/postgres
-      - REDIS_URL=redis://redis:6379/0
-
-  pgadmin:
-    image: dpage/pgadmin4
-    environment:
-      - PGADMIN_DEFAULT_EMAIL=admin@admin.com
-      - PGADMIN_DEFAULT_PASSWORD=admin
-    ports:
-      - "5050:80"
-    depends_on:
-      - postgres
